@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+# TODO: process multiple IPs for hostames (e.g. vladgalu.com)
+# TODO: cleanup regexps, make POSIX comptible, kind of messy
+# TODO: now uses getent instead of 'host'; check if either exists then test accordingly (using 'command -v host')...
+# TODO: Parameter parsing (-4, -6)
+# Sat 03 Jun 2023 04:51:04 AM EEST
+
+IPv4=1
+IPv6=1
+
+usage() {
+    echo "
+Show geolocation of IP address
+usage: $0 <IP or URL> [options]
+options:
+    -4		force IPv4 [*]
+    -6		force IPv6 [*]
+
+    * = not working properly, maybe TODO
+
+Input can be IPv4 or IPv6 address, hostname or URL
+"
+}
+
+IP=$@
+
+while getopts 46f:hd:s:qx: option
+do
+        case "${option}"
+        in
+                4) IPv4=1 ;;
+                6) IPv6=1 ;;
+                d) DOMAIN=${OPTARG};;
+                f) SERVERFILE=$OPTARG;;
+                s) WHOIS_SERVER=$OPTARG;;
+                q) QUIET="TRUE";;
+		h) usage; exit 0 ;;
+                \?) usage; exit 1 ;;
+        esac
+done
+
+shift $((OPTIND-1))
+
+ARG=$@
+
+re_url='.*\/.*'
+re_ipv4='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+re_ipv6=
+
+if [ -n "$ARG" ]; then
+    if [[ "$ARG" =~ $re_ipv4 ]]; then
+	echo "looks like a IPv4 address"
+    elif [ "$ARG" != "${1#*:[0-9a-fA-F]}" ]; then
+	echo "looks like an IPv6 address"
+    elif [[ $ARG =~ $re_url ]]; then
+	echo "looks like an URL, getting servername"
+	IP=`echo "$ARG" | sed -e 's|^[^/]*//||' -e 's|/.*$||'`
+	echo "$IP"
+	IP=`getent ahostsv4 $IP | grep STREAM | cut -d" " -f1`
+    else
+	echo "not an IP or URL, should be a hostname"
+	IP=`getent ahostsv4 $IP | grep STREAM | head -1 | cut -d" " -f1`
+    fi
+fi
+
+[ -z "$@" ] && {
+    echo "no IP address supplied, trying this machine's external IP"
+    IP=$(curl -4 -sL icanhazip.com)
+    [ -z "$IP" ] && {
+	echo "Can't get IPv4 address, trying IPv6"
+	IP=$(curl -6 -sL icanhazip.com)
+    }
+}
+
+[ -z "$IP" ] && { echo "'$@': can't find address!"; exit 1; }
+
+curl -sL ipinfo.io/$IP | grep -v "missingauth" | awk -F\" '{ print $4 }'
