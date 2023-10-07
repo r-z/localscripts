@@ -1,0 +1,587 @@
+#!/bin/bash
+
+# TODO: read URLs from https://looking.house/points.php (parse directly)
+# TODO: cleanup, a lot... messy code
+# TODO: option not to output to logfile
+# TODO: option to match regexp!
+# TODO: compact entries to http://test.server/{file1, file2[, file3, ..]}
+# TODO: (maybe) make it work with wget
+#	or http://test.server/file1, file2[, file3..]
+# - modified to be able to run with curl
+
+MYVERSION=0.21-alpha
+MYNAME=`basename $0`
+DEFAULT_OUTFILE="$MYNAME-`date '+%Y-%m-%d_%H_%M_%S'`.log"
+#DEFAULT_OUTFILE="$MYNAME-`date '+%Y%m%d_%H_%M_%S'`.log"
+
+BASE_URL="http://r2dev.ro/scripts" # use this if no config file found
+CONFFILE_URL="$BASE_URL/lg-servers.conf"
+
+CURL_CONNECT_TIMEOUT=10
+# curl max. time on a dl
+#CURL_MAX_TIME=300 # 5 min
+CURL_MAX_TIME=60 # 1 min
+# if greater than this, warn user (may take a long time)
+MAX_SERVERS=25
+
+echo "VPS Mass Speed Tester v$MYVERSION"
+
+printhelp() {
+    echo "
+Test file download speed from servers in a (looking glass) database
+Usage: $MYNAME options ] [text to match]
+
+'text to match' is case insensitive by default.
+Regexps and multiple strings are not supported (yet)
+
+Options:
+    -c <configfile>	read server list from <configfile>
+#    -l <location>	only test servers in <location> (case insensitive)
+    -u <url>		read conf file from URL
+    -o [outputfile]	print results to outputfile
+	(default: $MYNAME-<hostname>-[match]-<filesize>-<date>_<time>.log
+
+#    --comments		print (matching) comments
+    -cs 		case sensitive match
+#    -re		match regular expression
+#    -n			print to stdout only (no log file)
+    -4			test using IPv4
+    -6			test using IPv6
+
+    -e <speed>		only test servers with speed <speed> (in Mbit/s) [**]
+    -z <speed>		only test servers with speed <speed> or higher (in Mbit/s) [**]
+
+#    -s <size>		only test files matching <size> (in MB) or lower [***]
+    -q			only test small files <= 100MB [***]
+    -b			only test big files >=500MB [***]
+    -a			test ALL files [***]
+    -p			do not test, only print matching servers
+
+    -pr | --provider <string>	list providers matching <string> ; use \"*\" (with quotes) to list all (does not filter by size yet)
+
+#    -g			use 1GB files
+    -y			force (assume 'yes' on all queries)
+    -t <timeout>	set curl connect timeout
+
+    -y			assume 'yes' on all prompts
+    -d			debug output
+
+    [*]		= not working properly yet, using $DEFAULT_OUTFILE (??)
+    [**]	= not working properly, server count is wrong
+    [***]	= in progress, untested; not working for lower than
+
+Config file line format (no quotes): '[proto] <url> <provider> | Location'
+proto (optional): 4=IPv4, 6=IPv6, 10=both
+Lines starting with # are ignored (comments)
+
+Can be run from a remote server with the following commands:
+    curl -sL $BASE_URL/testvps | bash -s -- -y [options]
+"
+}
+
+basename() {
+  local name="${1##*/}"
+  echo "${name%$2}"
+}
+
+# catch_abort (stolen from yabs)
+# Purpose: catch CTRL+C signals in order to exit the script cleanly and remove temp files.
+abort() {
+#	echo -e "\n*** Aborting. Cleaning up files...\n"
+	echo -e "\n*** Aborting."
+	[ $DBG ] && echo "[DBG] Cleaning up temp files..."
+	rm -f "$TMPFILE" "$TMP_CONFFILE"
+#	unset LC_ALL
+	exit 1
+}
+
+check_command() {
+    command -v $1 >/dev/null 2>&1 || { echo "This program requires '$1' to be installed, but it was not found on this system!"; exit 1; }
+}
+
+# trap CTRL+C signals to exit script cleanly
+trap abort INT
+
+# Argument parsing
+while [ $# -gt 0 ]; do
+  case "$1" in 
+    -c | --config-file )
+	[ -z "$2" ] && { echo "Error: option '$1' requires an argument!"; exit 1; }
+	CONFFILE=$2; shift 2
+    ;;
+    -u | --config-url )
+	if [[ $OPTARG != */* ]]; then # test if URL
+	    CONFFILE_URL$2; shift 2
+	elif [ -n $2 ]; then
+	    CONFFILE_URL="$BASE_URL/$OPTARG"
+	    read -p "No URL supplied, try '$CONFFILE_URL'? [Y/n]: "
+	    [ "${REPLY^^}" = "N" ] && abort
+	    shift
+	else
+	    echo "Error: option '$1' requires an argument!"; exit 1
+	fi
+    ;;
+    -o)
+	SAVE_OUTPUT=1; echo "Saving output to file"; shift
+    ;;
+    -s | --size )
+	[ -z "$2" ] && { echo "Error: option '$1' requires an argument!"; exit 1; }
+	FILE_SIZE=$2; shift 2
+    ;;
+    -q )
+	FILE_SIZE=100; 	CURL_MAX_TIME=60 # max time spent on a server = 1 min
+	shift
+    ;;
+    -b | --big )
+	FILE_SIZE=1000; MAX_SERVERS=10; CURL_MAX_TIME=300 # max time=5 min
+	shift
+    ;;
+    -a | --all-sizes )
+	echo "Warning: testing ALL file sizes, this may take a long time!"
+	TEST_ALL=1; shift
+    ;;
+    -cs )
+	CASE_SENSITIVE=1; shift
+    ;;
+
+    -r | --list-providers )
+	ACTION="list_providers"
+	[ -n "$2" ] && { MATCH_PROVIDERS=$2; shift; }
+	shift
+    ;;
+    -4 )
+	PROTO="-4"; shift
+    ;;
+    -6 )
+	PROTO="-6"; shift
+    ;;
+    -p )
+	PRINT_ONLY=1; shift
+    ;;
+    -t | --timeout )
+	[ -z "$2" ] && { echo "Error: option '$1' requires an argument!"; exit 1; }
+	CURL_CONNECT_TIMEOUT=$2; shift 2
+    ;;
+    -x | --exec-time )
+	[ -z "$2" ] && { echo "Error: option '$1' requires an argument!"; exit 1; }
+	CURL_MAX_TIME=$2; shift 2
+    ;;
+    -y | --force-yes )
+	FORCE_YES=1; shift
+    ;;
+    -h* | --help )
+	printhelp; exit 0
+    ;;
+    -d | --debug )
+	DBG=1; shift
+    ;;
+    -* | --* )
+	echo "$1: unsuported option! Use -h for help"; exit 1
+    ;;
+    *) # matching
+	if [ -z "$MATCHING" ]; then
+	    MATCHING="$1"
+	else
+	    MATCHING="$MATCHING $1"
+	fi
+	shift
+    ;;
+  esac
+done
+
+######################################## MAIN ########################################
+
+[ $DBG ] && echo "[DBG] CONFFILE: $CONFFILE"
+[ $DBG ] && echo "[DBG] CONFFILE_URL: $CONFFILE_URL"
+[ $DBG ] && echo "[DBG] SAVE_OUTPUT: $SAVE_OUTPUT"
+[ $DBG ] && echo "[DBG] FILE_SIZE: $FILE_SIZE"
+[ $DBG ] && echo "[DBG] TEST_ALL: $TEST_ALL"
+[ $DBG ] && echo "[DBG] CASE_SENSITIVE: $CASE_SENSITIVE"
+[ $DBG ] && echo "[DBG] MATCHING: $MATCHING"
+
+#DBG=1
+
+# force yes response if not running interactively
+#[ -z "$PS1" ] && FORCE_YES=1
+#echo "**************** PS1: $PS1"
+#echo "FORCE_YES: $FORCE_YES"
+
+check_command curl
+check_command mktemp
+check_command grep
+check_command awk
+check_command sort
+check_command uniq
+check_command cut
+check_command tac
+check_command sed
+check_command printf
+
+
+if ! [ -r "$CONFFILE" ]; then
+    [ -n "$CONFFILE" ] && echo "Can't read config file '$CONFFILE'!"
+#    [ -z "$CONFFILE" ] && echo -n "Config file not specified!" # || echo -n "configfile '$CONFFILE' does not exist or is unreadable!"
+    [ -z "$FORCE_YES" ] && {
+	read -p "Read config from URL: $CONFFILE_URL? [Y/n] "
+#	[ -z "$PS1" ] && REPLY=Y
+	[ "${REPLY^^}" = "N" ] && abort
+    }
+    echo "Reading servers from url: $CONFFILE_URL"
+    TMP_CONFFILE=`mktemp -t $MYNAME-config.XXXXXX`
+    CONFFILE="$TMP_CONFFILE"
+    curl -o "$CONFFILE" -sL "$CONFFILE_URL"
+fi
+
+[ "$ACTION" = "list_providers" ] && {
+    echo -n "-- Listing providers"; [ -n "$MATCH_PROVIDERS" ] && echo -n " matching '$MATCH_PROVIDERS'"; echo ":"
+# could be better/more efficient...
+    PROVIDERS=`grep http $CONFFILE | grep -v ^# | awk -F"://" '{print $2}' | awk '{for (i=2; i<NF; i++) printf $i " "; print $NF}' | cut -d"|" -f1 | sort | uniq | grep -i -E "$MATCH_PROVIDERS"`
+    TOTAL_PROVIDERS=`echo "$PROVIDERS" | wc -l`
+    [ -z "$PROVIDERS" ] && { echo "No providers matching '$MATCH_PROVIDERS'."; exit 1; }
+
+    echo "$PROVIDERS"
+    echo -n "-- Total: $TOTAL_PROVIDERS providers"; [ -n "$MATCH_PROVIDERS" ] && echo " providers matching '$MATCH_PROVIDERS'" || echo ""
+    exit 0
+}
+
+# match only filesizes...
+
+# default to 100MB files
+[ -z "$FILE_SIZE" ] && [ -z "$TEST_ALL" ] && { echo "No file size specified, using 100MB"; FILE_SIZE=100; }
+
+if [ -n "$FILE_SIZE" ]; then
+#    echo "Setting filesize: $FILE_SIZE"
+    case "${FILE_SIZE^^}" in
+    100|100M*)
+#	echo "Testing only files with size 100MB and below"
+	# match: 100M, 100MB, 100.MB...
+	# regex to use for matching test filenames <= 100MB
+#	SIZE_GREP="(\/(10|25|100|128)[M|\.M])" # working, but not for Vultr
+# write a regexp for GNU grep that matches any of the following strings separated by commas: /vultr.com.100M, /100M, /100m, /100.m, /100.M, /100.bin, /100.BIN, /100.test, /128M, /128m, /10m, /10M, /25m, /25M
+	SIZE_GREP="/((vultr\.com\.100M)|(100(M|m|\.m|\.M|\.bin|\.BIN|\.test|25M|25m|10M|10m|128M|128m)))" # courtesy of ChatGPT
+    ;;
+    500|500M*|512|512M*)
+	echo "Testing files with size 500MB - 1GB. Warning: this may take a long time!"
+	# match: 1000M, 1000MB, 500MB
+	# regex to use for matching test filenames =~ 1GB
+	SIZE_GREP="(\/(500|512|700|1000|1024)[M|\.M]|1G)"
+    ;;
+    1000|1000M*|1024|1024M*|1G*)
+	echo "Testing  files with size 1GB. Warning: this may take a long time!"
+	# match: 1000M, 1000MB,
+	# regex to use for matching test filenames =~ 1GB
+#	SIZE_GREP="(\/(1000|1024)[M]|1G)" # working, but not for Vultr
+# write a regexp for GNU grep that matches any of the following strings separated by commas: /vultr.com.1000M, /1000M, /1000m, /1000.m, /1000.M, /1000.bin, /1000.BIN, /1000.test, /1G, /1g /1024M, /1024m
+	SIZE_GREP="/((vultr\.com\.1000M)|(1000(M|m|\.m|\.M|\.bin|\.BIN|\.test)|1(G|g)|1024(M|m)))" # courtesy of ChatGPT
+    ;;
+    *)
+	echo "Warning: unknown size: $FILE_SIZE"
+    ;;
+    esac
+fi
+
+[ $DBG ] && echo "[ $DBG ] FILE_SIZE: $FILE_SIZE"
+
+# TODO: filter by speed
+# possible speeds (Mbit/s): 10 15 25 30 50 80 100 200 250 500 1000 2000 5000 10000
+
+# count total number of servers to test
+# echo "SIZE_GREP: $SIZE_GREP"
+if [ -n "$MATCHING" ]; then
+#    echo "executing: grep -v \^\# $CONFFILE | grep -i -E \"$SIZE_GREP\" |  grep -c -i \"$MATCHING\""
+    TOTAL_SERVERS=`grep -v \^\# $CONFFILE | grep -i -E "$SIZE_GREP" |  grep -c -i "$MATCHING"`
+else
+    TOTAL_SERVERS=`grep -v \^\# $CONFFILE | grep -c -i -E "$SIZE_GREP"`
+fi
+
+[ "$TOTAL_SERVERS" = "0" ] && { echo -e "\n'$MATCHING': No matches!"; abort; }
+
+# calculate approx. execution time on various bandwidths
+# 100 MB file	: 100 Mbps:  8s ( ~10s with overhead); 1 Gbps: 0.8s (~1s with overhead); 10 Gbps: ???s (~???s with overhead)
+# 1 GB file	: 100 Mbps: 80s (~100s with overhead); 1 Gbps: ???s (~s? with overhead); 10 Gbps: ???s (~???s with overhead)
+DL_100MB_100Mbps=$(($TOTAL_SERVERS * 10)); DL_100MB_100Mbps_min=$(($DL_100MB_100Mbps / 60 + 1))
+DL_1GB_100Mbps=$(($TOTAL_SERVERS * 100)); DL_1GB_100Mbps_min=$(($DL_1GB_100Mbps / 60 + 1))
+
+DL_100MB_1Gbps=$(($TOTAL_SERVERS * 1)); DL_100MB_1Gbps_min=$(($DL_100MB_1Gbps / 60 + 1))
+DL_1GB_1Gbps=$(($TOTAL_SERVERS * 10)); DL_1GB_1Gbps_min=$(($DL_1GB_1Gbps / 60 + 1))
+
+#DL_100B_10Gbps=expr $TOTAL_SERVERS / 10; 
+#DL_1GB_10Gbps=expr $TOTAL_SERVERS * 1; 
+
+echo -n "Estimated execution time: "
+case "$FILE_SIZE" in
+#    100) echo "@100Mbps: ~${DL_100MB_100Mbps}s (~${DL_100MB_100Mbps_min}m); @1Gbps: ~${DL_100MB_1Gbps}s (~${DL_100MB_1Gbps_min}m)" ;;
+    100) echo "@100Mbps: ~${DL_100MB_100Mbps}s ($(($DL_100MB_100Mbps_min-1))-${DL_100MB_100Mbps_min}m); @1Gbps: ~${DL_100MB_1Gbps}s ($(($DL_100MB_1Gbps_min-1))-${DL_100MB_1Gbps_min}m)" ;;
+#    1000) echo "@100Mbps: ~${DL_1GB_100Mbps}s (~${DL_1GB_100Mbps_min}m); @1Gbps: ~${DL_1GB_1Gbps}s (~${DL_1GB_1Gbps_min}m)" ;;
+    1000) echo "@100Mbps: ~${DL_1GB_100Mbps}s ($(($DL_1GB_100Mbps_min-1))-${DL_1GB_100Mbps_min}m); @1Gbps: ~${DL_1GB_1Gbps}s ($(($DL_1GB_1Gbps_min-1))-${DL_1GB_1Gbps_min}m)" ;;
+    *) echo "Warning: File size '$FILE_SIZE' not supported!" ;;
+esac
+
+if [ "$TOTAL_SERVERS" -gt "$MAX_SERVERS" ] && [ -z "$FORCE_YES" ] && [ -z "$PRINT_ONLY" ]; then
+    read -p "Do you really wish to test $TOTAL_SERVERS servers? This could take a while! [y/N]: "
+    [ "${REPLY^^}" != "Y" ] && abort
+fi
+
+[ -n "$PROTO" ] && {
+    case "$PROTO" in
+	-4) echo "Using IPv4 (forced)" ;;
+	-6) echo "Using IPv6 (forced)" ;;
+    esac
+}
+
+#echo "Max execution time: $(expr $CURL_MAX_TIME / 60) min"
+echo "Connection timeout: ${CURL_CONNECT_TIMEOUT}s; Max execution time: ${CURL_MAX_TIME}s"
+
+echo -n "Testing $TOTAL_SERVERS servers"
+[ -n "$MATCHING" ] && echo -n " matching '$MATCHING'"
+echo " with test file size <= $FILE_SIZE MB"
+
+echo "--------------------------------------------------------------------------------"
+start_time=$SECONDS
+
+TMPFILE=`mktemp -t $MYNAME.XXXXXX`
+
+# output file name should contain hostname and match string
+if [ -n "$MATCHING" ] && [ -z "$OUTFILE" ] ; then
+    OUTFILE="$MYNAME-`uname -n`-$MATCHING-$FILE_SIZE-`date '+%Y-%m-%d_%H_%M_%S'`.log"
+else
+    OUTFILE="${OUTFILE:-$DEFAULT_OUTFILE}"
+fi
+
+SUMMARY=""
+
+CURRENT_SERVER=0
+
+# Start processing config file
+while IFS= read -r l; do
+    LINE_NO=$((LINE_NO+1)) # line number
+    # skip line if $MATCHING is set and no match
+    # changed to not use grep; much faster!
+#    [ -n "$MATCHING" ] && {
+#	if [ -z "`echo "$l" | grep -i "$MATCHING"`" ]; then continue; fi
+#    }
+
+    if [ -n "$MATCHING" ]; then # skip if line doesn't match
+	[ -n "$CASE_SENSITIVE" ] && {
+	    # case sensitive match
+#	    [[ -n "$MATCHING" && $l != *"$MATCHING"* ]] && echo "case sensitive match"
+	    [[ -n "$MATCHING" && $l != *"$MATCHING"* ]] && continue
+	} || {
+	    # case insensitive match (default)
+	    [[ -n "$MATCHING" && ${l^^} != *"${MATCHING^^}"* ]] && continue
+	}
+    fi
+
+#    [[ -n "$MATCHING" && ${l^^} != *"${MATCHING^^}"* ]] && continue
+
+    # trim leading/trailing spaces: https://unix.stackexchange.com/questions/476455/how-to-remove-leading-and-trailing-spaces-from-a-shell-variable
+    lead=${l%%[^[:blank:]]*}; trail=${l##*[^[:blank:]]} # get leading & trailing space
+    l=${l%${trail}}; l=${l#${lead}} # remove trailing & leading space
+    [ -z "$l" ] && continue # skip if blank line
+
+    # read line text into array
+    read -r -a a <<< "$l"
+
+    # display comment if line is a comment, then skip
+    [ "${l::1}" = "#" ] && { echo "$l"; continue; }
+
+    # enable IPv4 by default (not working currently*)
+    IPv4=1
+
+    # if first field is number, it's interpreted as host IPv4/IPv6 support
+    re='^[0-9]+$'
+    if [[ ${a[0]} =~ $re ]] ; then # first field is number
+	case ${a[0]} in
+	    4) IPv4=1; IPv6= ;;
+	    6) IPv4=; IPv6=1 ;;
+	    10) IPv4=1; IPv6=1 ;;
+	    *) echo "Warning: Line $LINE_NO: first field should be either 4 (IPv4), 6 (IPv6) or 10 (both)" ;;
+	esac
+	URL=${a[1]}
+	unset a[0]; unset a[1]
+	DESCRIPTION=${a[@]}
+    else # first field is not number (should be URL)
+	URL=${a[0]}
+	re='(https?|ftp)://[-[:alnum:]\+&@#/%?=~_|!:,.;]*[-[:alnum:]\+&@#/%=~_|]'
+	if ! [[ $URL =~ $re ]]; then
+	    echo "Warning: Line $LINE_NO: not a valid URL: $URL"
+	    continue
+	fi
+	unset a[0]
+	DESCRIPTION=${a[@]}
+    fi
+
+    FNAME=${URL##*/}
+
+    # match only filesizes...
+#    if [ -n "$SIZE_GREP" ]; then
+	# small change to include "/filename" because otherwise some hostnames might match and we don't want that
+	[[ -n "$SIZE_GREP" && -z $(echo "/$FNAME" | grep -i -E "$SIZE_GREP") ]] && continue
+
+#    echo "DESCRIPTION: $DESCRIPTION"
+    # trim whitespaces
+    DESCRIPTION=${DESCRIPTION## }; DESCRIPTION=${DESCRIPTION%% }
+
+    IFS="|" read -r PROVIDER LOCATION <<< "$DESCRIPTION"
+    [ -z "$LOCATION" ] && LOCATION=$PROVIDER
+
+    LOCATION=${LOCATION%% }; LOCATION=${LOCATION## }
+    PROVIDER=${PROVIDER%% }; PROVIDER=${PROVIDER## }
+
+#    echo "DESCRIPTION: $DESCRIPTION"
+#    echo "URL: $URL; PROVIDER: $PROVIDER; LOCATION: $LOCATION; IPv4: $IPv4; IPv6: $IPv6"
+
+    let "CURRENT_SERVER=CURRENT_SERVER+1"
+    echo -n "[$(date '+%H:%M:%S')] "
+    printf "[%s/%s] %s (%s) %s\n" $CURRENT_SERVER $TOTAL_SERVERS "$PROVIDER: $LOCATION" "$URL"
+
+    # skip if PRINT_ONLY flag is set
+    [ -n "$PRINT_ONLY" ] && continue
+
+    curl $PROTO --connect-timeout $CURL_CONNECT_TIMEOUT --max-time $CURL_MAX_TIME -k -L -o /dev/null $URL 2> >(tee -a $TMPFILE >&2)
+    speed=`tail -1 $TMPFILE | awk '{ print $(NF-5) }'`
+#    SUMMARY="$SUMMARY"`printf "%-39s: %7s   %s\n" "$PROVIDER: $CITY, $COUNTRY" "$speed" "$URL"`"\n"
+    SUMMARY="$SUMMARY"`printf "%-39s: %7s/s %s\n" "$PROVIDER: $LOCATION" "$speed" "$URL"`"\n"
+#    SUMMARY="$SUMMARY $(printf "%-39s: %7s/s %s\n" "$PROVIDER: $LOCATION" "$speed" "$URL")\n"
+done < $CONFFILE # done reading conf file
+
+[ $DBG ] && echo "[DBG] [$(date '+%H:%M:%S')] done parsing configfile"
+
+# cleanup
+rm -f "$TMPFILE" "$TMP_CONFFILE"
+
+[ -n "$SUMMARY" ] && {
+    echo -e "\nSummary:"
+    echo "--------------------------------------------------------------------------------"
+    # sort results
+    # https://stackoverflow.com/questions/55926142/how-to-use-a-unix-sort-command-to-sort-by-human-readable-numeric-file-size-in-a
+    OUTPUT=`echo -e "$SUMMARY" | sed 's/[0-9][mgt]/\U&/g' | sort -r -t ":" -k3h | tac`
+
+#    command -v wget >/dev/null 2>&1 && MYIP="$(wget -qO- ipinfo.io/ip)"
+    MYIP=`curl -s ipinfo.io/ip`
+    OUTPUT_HEADER="[$(date '+%Y-%m-%d %H:%M')] host: $(uname -n)"
+    [ -n "$MYIP" ] && OUTPUT_HEADER="$OUTPUT_HEADER ($MYIP)"
+    [ -n "$MATCHING" ] && OUTPUT_HEADER="$OUTPUT_HEADER matching: $MATCHING"
+#    OUTPUT=`echo -e "host: $(uname -n) (IP: $(curl ipinfo.io/ip)\n`"$OUTPUT"
+    OUTPUT="$OUTPUT_HEADER\n$OUTPUT"
+
+    echo -e "$OUTPUT"
+    [ "$OUTFILE" ] && {
+	echo "--------------------------------------------------------------------------------"
+	echo -e "$OUTPUT" > "$OUTFILE"
+	echo "Output written to: $OUTFILE"
+    }
+}
+
+elapsed=$(( SECONDS - start_time ))
+eval "echo Elapsed time: $(date -ud "@$elapsed" +'$((%s/3600/24)) days %H hr %M min %S sec')"
+exit 0
+
+
+
+#### OLD STUFF
+
+while IFS= read -r l; do
+
+#    [ $DBG ] && echo "MATCHING: $MATCHING"
+    # skip line if not matching
+    IFS="|" read -r -a a <<< "$l"
+    read -r IPv4 IPv6 <<< "${a[0]}"
+
+    PROVIDER=${a[1]%% }; PROVIDER=${PROVIDER## }
+    IFS=";" read -r LOCATION DC <<< "${a[2]}"
+    DC=${DC/Data center: /}; DC=${DC%% }; DC=${DC## }
+
+    IFS="," read -r COUNTRY CITY ADDR <<< "${LOCATION}"
+    COUNTRY=${COUNTRY%% }; COUNTRY=${COUNTRY## }
+    CITY=${CITY%% }; CITY=${CITY## }
+    ADDR=${ADDR%% }; ADDR=${ADDR## }
+
+    URL=${a[3]%% }; URL=${URL## }
+    URL_FILE=${URL##*/}
+#    GB_URL=${URL/100\.mb/1000\.mb}
+#    [ -n "$USE_GB" ] && URL=${URL/100\.mb/1000\.mb}
+
+    re='(https?|ftp)://[-[:alnum:]\+&@#/%?=~_|!:,.;]*[-[:alnum:]\+&@#/%=~_|]'
+    if ! [[ $URL =~ $re ]]; then
+	echo "Warning: not a valid URL: $URL; skipping!"
+	continue
+    fi
+
+    PORTSPEED=${a[4]%% }; PORTSPEED=${PORTSPEED## }
+    read -r SPEED JUNK <<< "${PORTSPEED}"
+
+# ***
+    [[ "$SPEED" -lt "$SPEED_MIN" ]] && { echo "Speed below $SPEED_MIN"; continue; }
+
+#    echo -n "IPv4: $IPv4"
+#    [ -n "$IPv6" ] && echo -n "; IPv6: $IPv6"
+#    echo -n "; PROVIDER: $PROVIDER; URL=$URL; PORTSPEED=$PORTSPEED; COUNTRY=$COUNTRY; CITY=$CITY"
+#    [ -n "$ADDR" ] && echo -n " (ADDR: $ADDR)" || echo -n ""
+#    echo "; DC=$DC"
+#    echo "URL_FILE: $URL_FILE; GB_URL=$GB_URL"
+    #echo "full loc: ${a[2]}"
+
+    let "CURRENT_SERVER=CURRENT_SERVER+1"
+    echo -n "[$(date '+%H:%M:%S')] "
+    printf "[%s/%s] %s (%s) %s\n" $CURRENT_SERVER $TOTAL_SERVERS "$PROVIDER: $CITY, $COUNTRY" "$URL" "$PORTSPEED"
+
+    # skip if PRINT_ONLY flag is set
+    [ -n "$PRINT_ONLY" ] && continue
+
+    curl $PROTO --connect-timeout $CURL_CONNECT_TIMEOUT --max-time $CURL_MAX_TIME -k -o /dev/null $URL 2> >(tee -a $TMPFILE >&2)
+    speed=`tail -1 $TMPFILE | awk '{ print $(NF-5) }'`
+    SUMMARY="$SUMMARY"`printf "%-39s: %7s   %s\n" "$PROVIDER: $CITY, $COUNTRY" "$speed" "$URL"`"\n"
+
+done < $CONFFILE
+
+echostyle(){
+	if hash tput 2>$NULL; then
+		echo " $(tput setaf 6)$1$(tput sgr0)"
+		echo " $1" >> $log
+	else
+		echo " $1" | tee -a $log
+	fi
+}
+
+# main function for speed checking
+# the report speed are average per file
+speed() {
+	# print name
+	printf "%s" " $1" | tee -a $log
+
+	# get download speed and print
+	C_DL=$( curl -m 4 -w '%{speed_download}\n' -o $NULL -s "$2" )
+	printf "%s\n" "$(FormatBytes $C_DL) $(pingtest $2)" | tee -a $log
+}
+
+pingtest() {
+	# ping one time
+	local ping_link=$( echo ${1#*//} | cut -d"/" -f1 )
+	local ping_ms=$( ping -w1 -c1 $ping_link | grep 'rtt' | cut -d"/" -f5 )
+
+	# get download speed and print
+	if [[ $ping_ms == "" ]]; then
+		printf " | ping error!"
+	else
+		printf " | ping %3i.%sms" "${ping_ms%.*}" "${ping_ms#*.}"
+	fi
+}
+
+FormatBytes() {
+	bytes=${1%.*}
+	local Mbps=$( printf "%s" "$bytes" | awk '{ printf "%.2f", $0 / 1024 / 1024 * 8 } END { if (NR == 0) { print "error" } }' )
+	if [[ $bytes -lt 1000 ]]; then
+		printf "%8i B/s |      N/A     "  $bytes
+	elif [[ $bytes -lt 1000000 ]]; then
+		local KiBs=$( printf "%s" "$bytes" | awk '{ printf "%.2f", $0 / 1024 } END { if (NR == 0) { print "error" } }' )
+		printf "%7s KiB/s | %7s Mbps" "$KiBs" "$Mbps"
+	else
+		# awk way for accuracy
+		local MiBs=$( printf "%s" "$bytes" | awk '{ printf "%.2f", $0 / 1024 / 1024 } END { if (NR == 0) { print "error" } }' )
+		printf "%7s MiB/s | %7s Mbps" "$MiBs" "$Mbps"
+
+		# bash way
+		# printf "%4s MiB/s | %4s Mbps""$(( bytes / 1024 / 1024 ))" "$(( bytes / 1024 / 1024 * 8 ))"
+	fi
+}
